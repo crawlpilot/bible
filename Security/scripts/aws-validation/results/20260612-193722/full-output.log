@@ -1,0 +1,35 @@
+
+[1m[0;34m
+════════════════════════════════════════════════════════════
+  IAM Security Validation                                   
+════════════════════════════════════════════════════════════
+[0m
+  [0;32mAccount :[0m 662267689671
+  [0;32mIdentity:[0m arn:aws:iam::662267689671:user/Rahul.Bisht
+  [0;32mRegion  :[0m us-east-1
+
+[1m[0;34m━━━ Root Account ━━━[0m
+  [0;32m[PASS][0m Root account has no access keys
+  [0;32m[PASS][0m Root account has MFA enabled
+
+[1m[0;34m━━━ IAM Users ━━━[0m
+  [1;33m[WARN][0m 13 IAM user(s) found — prefer IAM Identity Center over long-lived IAM users
+  [0;36m[INFO][0m Users: abhijit.mangalgiri	aditya.singh	hruthvik.naik	nitin.ramakoti	pankaj.singh	Prashant.Singh	Rahul.Bisht	Rajesh.Singh	ses-smtp-user.20151121-195310	shopright_bestseller_artifacts	Sunidhi.Sachdeva	tgt.newton.metrics	Yash.Agarwal,
+
+[1m[0;34m━━━ IAM Users — MFA Enforcement ━━━[0m
+  [0;31m[FAIL][0m IAM users WITHOUT MFA: nitin.ramakoti Rahul.Bisht Rajesh.Singh ses-smtp-user.20151121-195310 shopright_bestseller_artifacts tgt.newton.metrics Yash.Agarwal
+
+[1m[0;34m━━━ IAM Users — Console Access & Password Age ━━━[0m
+  [0;31m[FAIL][0m Access keys older than 90 days: aditya.singh(20616d) hruthvik.naik(20616d) nitin.ramakoti(20616d) pankaj.singh(20616d) Prashant.Singh(20616d) Rahul.Bisht(20616d) Rajesh.Singh(20616d) ses-smtp-user.20151121-195310(20616d) shopright_bestseller_artifacts(20616d) Sunidhi.Sachdeva(20616d) tgt.newton.metrics(20616d)
+
+[1m[0;34m━━━ IAM Account Password Policy ━━━[0m
+  [0;31m[FAIL][0m Password minimum length < 14 (current: 12)
+  [0;32m[PASS][0m Password requires uppercase
+  [0;32m[PASS][0m Password requires symbols
+  [1;33m[WARN][0m Password reuse prevention is 5 (recommend ≥ 24)
+  [0;32m[PASS][0m Password max age ≤ 90 days (90)
+
+[1m[0;34m━━━ Overprivileged IAM — Admin Policies on Users ━━━[0m
+  [0;31m[FAIL][0m Admin/wildcard policies found on users: nitin.ramakoti → arn:aws:iam::aws:policy/AdministratorAccess nitin.ramakoti → arn:aws:iam::aws:policy/AWSCodeCommitPowerUser
+
+[1m[0;34m━━━ IAM Roles — Wildcard Permissions ━━━[0m

@@ -1,0 +1,442 @@
+# 03 — Determinism & Reliability
+
+---
+
+## Why Agents Are Non-Deterministic
+
+An LLM call with `temperature > 0` is a **stochastic process**. Multiple layers of randomness compound across agent turns:
+
+```
+Sources of non-determinism in a 10-iteration agent:
+
+Layer 1: Model sampling (temperature > 0)
+         → Same input can produce different tool selections
+         
+Layer 2: Tool call argument generation
+         → "search for X" vs "search for X 2024" — different results
+         
+Layer 3: Tool execution side effects
+         → Web search results change over time
+         
+Layer 4: Context sensitivity
+         → Earlier tool results shift how later turns are reasoned
+         
+Layer 5: Model drift
+         → Model weights can change between API versions
+```
+
+Even with `temperature=0`, you don't get full determinism because:
+- Tool results (web, time, database) change
+- The model may use slightly different reasoning paths when inputs differ by even one token
+- Parallel tool calls may return in different order
+
+**Implication**: Don't design agents to produce bit-for-bit identical output. Design them to produce **consistently correct output** within defined quality bounds.
+
+---
+
+## Failure Taxonomy
+
+| Failure Type | What happens | Detection | Recovery |
+|-------------|-------------|-----------|---------|
+| Tool execution failure | Tool throws exception | `try/except` around dispatch | Retry (if idempotent) or fallback |
+| Hallucinated tool args | Model passes invalid args (wrong type, missing required field) | JSON schema validation | Return validation error, let model retry |
+| Infinite loop | Model keeps calling tools, never reaches `end_turn` | `max_iterations` counter | Hard abort |
+| Context overflow | Messages exceed context window | Token count check | Compress context then continue |
+| Partial completion | Agent gives up mid-task | Sentinel validation at exit | Resume from checkpoint |
+| Wrong tool selection | Model calls wrong tool | Post-hoc trace review | Better tool descriptions, routing rules |
+| Scope creep | Agent does extra work beyond the task | Sentinel scope check | Return only task-relevant output |
+| Silent degradation | Agent produces plausible-but-wrong output | LLM-as-judge evaluation | Improve evaluation, add examples |
+
+---
+
+## Strategies for Determinism
+
+### 1. Temperature = 0 for Structured Output Steps
+
+Use temperature 0 wherever you need consistent, parseable output:
+
+```python
+# Planning step: temperature 0.3 (some creativity OK)
+plan_response = client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=2000,
+    system="You are a task planner. Generate a JSON plan.",
+    messages=messages,
+    temperature=0.3,
+)
+
+# Extraction step: temperature 0 (must be exact)
+extract_response = client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=1000,
+    system="Extract the structured data as JSON. No prose.",
+    messages=messages,
+    temperature=0,    # Deterministic extraction
+)
+```
+
+### 2. Constrained Output via JSON Schema
+
+Force the model to produce valid structured output by asking for it explicitly in the system prompt and validating before accepting.
+
+```python
+import json
+from pydantic import BaseModel, ValidationError
+
+class ExtractionResult(BaseModel):
+    company_name: str
+    founded_year: int
+    headquarters: str
+    revenue_usd_millions: float | None
+
+EXTRACTION_SYSTEM = """
+Extract company information from the provided text.
+Respond with ONLY a valid JSON object matching this schema:
+{
+  "company_name": string,
+  "founded_year": integer,
+  "headquarters": string,
+  "revenue_usd_millions": number or null
+}
+No explanation. No markdown. Only the JSON object.
+"""
+
+def extract_with_retry(text: str, max_retries: int = 3) -> ExtractionResult:
+    messages = [{"role": "user", "content": text}]
+    
+    for attempt in range(max_retries):
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            system=EXTRACTION_SYSTEM,
+            messages=messages,
+            temperature=0,
+        )
+        
+        raw = response.content[0].text.strip()
+        
+        try:
+            data = json.loads(raw)
+            return ExtractionResult(**data)
+        except (json.JSONDecodeError, ValidationError) as e:
+            # Feed the error back — model self-corrects
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({
+                "role": "user",
+                "content": f"That response was invalid JSON. Error: {e}. Try again."
+            })
+    
+    raise ExtractionError(f"Failed to extract valid JSON after {max_retries} attempts")
+```
+
+**When this fails**: If the model consistently can't produce valid JSON, the problem is usually the schema is too complex or the input is ambiguous. Simplify the schema or add few-shot examples.
+
+### 3. Idempotency Keys on State Mutations
+
+For any tool that writes state, require an idempotency key generated by the orchestrator (not the model):
+
+```python
+import uuid
+
+def create_order_with_idempotency(order_data: dict, task_id: str) -> dict:
+    # Key is derived from task context — deterministic for same task, unique across tasks
+    idempotency_key = f"{task_id}:create_order:{hash(json.dumps(order_data, sort_keys=True))}"
+    
+    return stripe.Order.create(
+        **order_data,
+        idempotency_key=idempotency_key
+    )
+    # If called twice with same key: returns same result, no duplicate charge
+```
+
+### 4. Deterministic Tool Routing (Pre-LLM)
+
+For high-traffic agents, don't let the model choose the tool on every turn — route programmatically for known patterns, only use the model for ambiguous cases:
+
+```python
+DETERMINISTIC_ROUTES = {
+    r"what is \d+ [+\-*/] \d+": "calculate",     # Math expressions
+    r"current time": "get_current_time",            # Time queries
+    r"user \d+ profile": "get_user_profile",        # User lookups
+}
+
+def route_task(task: str) -> str | None:
+    import re
+    for pattern, tool in DETERMINISTIC_ROUTES.items():
+        if re.search(pattern, task, re.IGNORECASE):
+            return tool
+    return None  # Fall through to model
+
+# In agent loop:
+tool = route_task(user_input)
+if tool:
+    result = dispatch_tool(tool, extract_args(user_input))   # No LLM call
+else:
+    response = client.messages.create(...)   # Let model decide
+```
+
+### 5. Two-Phase Commit — Plan Before Act
+
+Separate the **planning phase** (no side effects) from the **execution phase** (real actions). Human or automated approval between phases.
+
+```
+Phase 1: PLAN (read-only tools only)
+  Agent researches, reasons, produces a plan
+  Plan = list of concrete actions with expected outcomes
+  No writes, no sends, no deletes
+
+Approval gate:
+  [automated] Sentinel validates plan against policy
+  [manual]    Human reviews plan for high-risk operations
+
+Phase 2: EXECUTE (execute plan deterministically)
+  Agent executes approved plan step by step
+  No deviation from plan — if a step fails, abort (don't improvise)
+```
+
+```python
+PLANNING_TOOLS = ["web_search", "read_file", "get_user_info"]  # read-only
+EXECUTION_TOOLS = ["send_email", "write_file", "create_record"]  # write
+
+def run_two_phase_agent(task: str) -> str:
+    # Phase 1: plan with read-only tools
+    plan = run_agent(task, tools=PLANNING_TOOLS, system=PLANNER_SYSTEM)
+    
+    # Approval gate
+    validated = sentinel.validate(plan)
+    if not validated.approved:
+        raise PolicyViolation(validated.reason)
+    
+    # Phase 2: execute approved plan
+    result = run_agent(
+        task=f"Execute this approved plan exactly: {plan}",
+        tools=EXECUTION_TOOLS,
+        system=EXECUTOR_SYSTEM,
+    )
+    return result
+```
+
+---
+
+## Evaluation & Testing
+
+### Unit Testing Individual Tools
+
+```python
+import pytest
+from unittest.mock import patch
+
+def test_web_search_tool():
+    with patch("requests.get") as mock_get:
+        mock_get.return_value.json.return_value = {
+            "results": [{"title": "Test", "url": "https://test.com", "snippet": "Test snippet"}]
+        }
+        result = web_search(query="test query")
+        assert "Test snippet" in result
+        assert "https://test.com" in result
+```
+
+### Integration Testing Agent Trajectories
+
+Test the full trajectory — not just the final answer, but the sequence of tool calls.
+
+```python
+def test_research_agent_trajectory():
+    task = "Find the CEO of Stripe"
+    
+    with record_tool_calls() as recorder:
+        result = run_agent(task, tools=ALL_TOOLS)
+    
+    trajectory = recorder.get_trajectory()
+    
+    # Assert tool call sequence (order matters for this task)
+    assert trajectory[0].tool == "web_search"
+    assert "Stripe CEO" in trajectory[0].args["query"]
+    
+    # Assert final answer quality
+    assert "Patrick Collison" in result   # Known correct answer
+    assert len(result) > 50              # Not a one-word answer
+```
+
+### Trace-Based Regression Testing
+
+Record golden trajectories, replay them, compare:
+
+```python
+# Record golden trajectory
+golden = {
+    "task": "Research Stripe CEO",
+    "trajectory": [
+        {"tool": "web_search", "args": {"query": "Stripe CEO"}, "result": "..."},
+    ],
+    "final_answer": "Patrick Collison is the CEO of Stripe...",
+    "token_usage": {"input": 3200, "output": 450}
+}
+
+# Regression test: replay and compare
+def test_regression_stripe_ceo():
+    with replay_tools(golden["trajectory"]) as replayer:
+        result = run_agent(golden["task"], tools=MOCKED_TOOLS)
+    
+    # Allow some variation in phrasing, but key facts must match
+    assert "Patrick Collison" in result
+    assert replayer.trajectory_matches(golden["trajectory"], tolerance=0.8)
+```
+
+### LLM-as-Judge Evaluation
+
+Use a separate model call to evaluate output quality. Don't use the same model that generated the output — use a different model or a fresh instance.
+
+```python
+JUDGE_SYSTEM = """
+You are a rigorous evaluator. Score the agent's answer on:
+1. Accuracy (0-10): Are the facts correct?
+2. Completeness (0-10): Does it fully answer the question?
+3. Groundedness (0-10): Is it based on the provided sources, not hallucinated?
+
+Respond in JSON: {"accuracy": N, "completeness": N, "groundedness": N, "reasoning": "..."}
+"""
+
+def evaluate_answer(task: str, answer: str, sources: list[str]) -> dict:
+    eval_prompt = f"""
+Task: {task}
+Sources used: {sources}
+Agent answer: {answer}
+
+Score this answer.
+"""
+    response = client.messages.create(
+        model="claude-opus-4-8",   # Use a stronger judge than the agent
+        max_tokens=500,
+        system=JUDGE_SYSTEM,
+        messages=[{"role": "user", "content": eval_prompt}],
+        temperature=0,
+    )
+    return json.loads(response.content[0].text)
+```
+
+**Quality gate**: Reject answers where any score < 7. Log to monitoring.
+
+---
+
+## Guardrails Architecture
+
+### Input Guardrail (Pre-Agent)
+
+```python
+def validate_task(task: str, user_id: str) -> None:
+    # Scope check: is this task within allowed domains?
+    if not is_within_scope(task):
+        raise OutOfScopeError(f"Task not in allowed domains: {task[:100]}")
+    
+    # Rate limit: prevent abuse
+    if not rate_limiter.check(user_id, limit=10, window_seconds=60):
+        raise RateLimitError("Too many agent requests")
+    
+    # Safety check: no PII, no harmful content
+    if contains_harmful_content(task):
+        raise SafetyViolation("Task contains disallowed content")
+    
+    # Cost estimate: warn or block expensive tasks
+    estimated_cost = estimate_agent_cost(task)
+    if estimated_cost > MAX_COST_PER_REQUEST:
+        raise CostLimitError(f"Estimated cost ${estimated_cost:.2f} exceeds limit")
+```
+
+### Output Guardrail (Post-Agent, Sentinel Pattern)
+
+```python
+SENTINEL_SYSTEM = """
+You are a safety and quality checker. Given an agent's output, check:
+1. Does it answer the original task? (yes/no)
+2. Does it cite hallucinated sources? (yes/no — hallucinated means URLs that don't exist)
+3. Does it contain PII or sensitive data that shouldn't be returned? (yes/no)
+4. Is it within the scope of the task? (yes/no)
+
+Respond in JSON: {"passes": true/false, "issues": ["issue1", "issue2"]}
+"""
+
+def sentinel_check(task: str, answer: str) -> tuple[bool, list[str]]:
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",   # Fast + cheap for binary check
+        max_tokens=300,
+        system=SENTINEL_SYSTEM,
+        messages=[{"role": "user", "content": f"Task: {task}\nAnswer: {answer}"}],
+        temperature=0,
+    )
+    result = json.loads(response.content[0].text)
+    return result["passes"], result.get("issues", [])
+```
+
+---
+
+## Failure Recovery
+
+### Retry Policy by Tool Type
+
+```python
+RETRY_POLICY = {
+    "web_search":      {"max_retries": 3, "backoff": "exponential", "safe": True},
+    "fetch_page":      {"max_retries": 3, "backoff": "exponential", "safe": True},
+    "calculate":       {"max_retries": 1, "backoff": "none",        "safe": True},
+    "send_email":      {"max_retries": 0, "backoff": "none",        "safe": False},  # Never auto-retry
+    "write_database":  {"max_retries": 1, "backoff": "none",        "safe": False},  # Only with idempotency key
+}
+
+def dispatch_with_retry(tool_name: str, tool_input: dict) -> str:
+    policy = RETRY_POLICY.get(tool_name, {"max_retries": 1, "backoff": "exponential", "safe": False})
+    
+    for attempt in range(policy["max_retries"] + 1):
+        try:
+            return dispatch_tool(tool_name, tool_input)
+        except TransientError as e:
+            if attempt == policy["max_retries"]:
+                raise
+            sleep_time = (2 ** attempt) if policy["backoff"] == "exponential" else 0
+            time.sleep(sleep_time)
+        except PermanentError:
+            raise   # Don't retry permanent failures (404, auth error, invalid args)
+```
+
+### Checkpoint-Based Resume
+
+```python
+def run_agent_with_checkpoints(task: str, task_id: str) -> str:
+    # Load existing checkpoint if resuming
+    checkpoint = load_checkpoint(task_id)
+    if checkpoint:
+        messages = checkpoint["messages"]
+        iteration = checkpoint["iteration"]
+    else:
+        messages = [{"role": "user", "content": task}]
+        iteration = 0
+
+    for i in range(iteration, MAX_ITERATIONS):
+        response = run_one_turn(messages)
+        
+        if response.stop_reason == "end_turn":
+            delete_checkpoint(task_id)   # Clean up
+            return extract_final_answer(response)
+
+        # Save checkpoint after each successful turn
+        save_checkpoint(task_id, {
+            "messages": messages,
+            "iteration": i + 1,
+            "timestamp": time.time()
+        })
+
+        messages = update_messages(messages, response)
+```
+
+---
+
+## FAANG Interview Callout
+
+> **"How do you test an agent system?"**
+>
+> Three-level answer:
+> 1. **Unit**: Test each tool in isolation with mocked HTTP. Test the JSON schema validation layer. Fast, deterministic, run in CI.
+> 2. **Integration**: Run the full agent against a small set of fixed golden tasks with deterministic tool mocks. Assert trajectory (tool call sequence) and answer quality. These are your regression tests — alert if golden trajectory deviates by > 20%.
+> 3. **Evaluation**: Run weekly against a held-out eval set. Use LLM-as-judge (stronger model) to score accuracy, completeness, groundedness. Track score trend over time — model updates, prompt changes, and tool result format changes all silently affect quality.
+>
+> Then add: "The hardest part is not building the test — it's defining what 'correct' means for open-ended tasks. I use rubrics (scored dimensions) rather than exact string match, and I always keep a human baseline to calibrate the LLM judge against."
